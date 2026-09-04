@@ -119,7 +119,7 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
     Notice that the inferred dtype of 'geometry' columns is geometry.
 
     >>> gdf.dtypes
-    col1          object
+    col1             str
     geometry    geometry
     dtype: object
 
@@ -169,6 +169,9 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
             kwargs["columns"] = pd.Index([], dtype="str")
 
         super().__init__(data, *args, **kwargs)
+
+        if isinstance(data, DataFrame) and data.attrs:
+            self.attrs = data.attrs
 
         # set_geometry ensures the geometry data have the proper dtype,
         # but is not called if `geometry=None` ('geometry' column present
@@ -446,6 +449,8 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
                 )
             if drop:
                 del frame[col]
+                frame.__class__ = GeoDataFrame
+                # revert the casting done in __delitem__, keep gdf
                 warnings.warn(
                     given_colname_drop_msg,
                     category=FutureWarning,
@@ -468,6 +473,12 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         # update _geometry_column_name prior to assignment
         # to avoid default is None warning
         frame._geometry_column_name = geo_column_name
+        if isinstance(frame.columns, pd.MultiIndex) and not isinstance(
+            geo_column_name, tuple
+        ):
+            # when setting a single column to dataframe with multi-index columns,
+            # pandas does not like setting it with only the first level name
+            geo_column_name = (geo_column_name,) + ("",) * (frame.columns.nlevels - 1)
         frame[geo_column_name] = level
 
         if not inplace:
@@ -525,7 +536,12 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
                 return self.rename(columns={geometry_col: col}).set_geometry(
                     col, inplace=inplace
                 )
-            self.rename(columns={geometry_col: col}, inplace=inplace)
+            with warnings.catch_warnings():
+                # TODO: pandas >= 3.1 triggers a warning for inplace rename here
+                # suppresing this for now, but we have to replace this with our own
+                # warning specifically for rename_geometry
+                warnings.filterwarnings("ignore", ".*inplace keyword.*")
+                self.rename(columns={geometry_col: col}, inplace=inplace)
             self.set_geometry(col, inplace=inplace)
 
     @property
@@ -610,7 +626,7 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
                     "This unsafe behavior will be deprecated in future versions. "
                     "Use GeoDataFrame.set_crs method instead",
                     stacklevel=2,
-                    category=DeprecationWarning,
+                    category=FutureWarning,
                 )
             self.geometry.values.crs = value
         else:
@@ -908,7 +924,7 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         cls, table, geometry: str | None = None, to_pandas_kwargs: dict | None = None
     ):
         """
-        Construct a GeoDataFrame from a Arrow table object based on GeoArrow
+        Construct a GeoDataFrame from an Arrow table object based on GeoArrow
         extension types.
 
         See https://geoarrow.org/ for details on the GeoArrow specification.
@@ -942,6 +958,28 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         -------
         GeoDataFrame
 
+        See Also
+        --------
+        GeoDataFrame.to_arrow
+        GeoSeries.from_arrow
+
+        Examples
+        --------
+        >>> import geoarrow.pyarrow as ga
+        >>> import pyarrow as pa
+        >>> table = pa.Table.from_arrays([
+        ...     ga.as_geoarrow(
+        ...     [None, "POLYGON ((0 0, 1 1, 0 1, 0 0))", "LINESTRING (0 0, -1 1, 0 -1)"]
+        ...     ),
+        ...     pa.array([1, 2, 3]),
+        ...     pa.array(["a", "b", "c"]),
+        ... ], names=["geometry", "id", "value"])
+        >>> gdf = geopandas.GeoDataFrame.from_arrow(table)
+        >>> gdf
+                                   geometry   id  value
+        0                              None    1      a
+        1    POLYGON ((0 0, 1 1, 0 1, 0 0))    2      b
+        2      LINESTRING (0 0, -1 1, 0 -1)    3      c
         """
         from geopandas.io._geoarrow import arrow_to_geopandas
 
@@ -1124,14 +1162,8 @@ individually so that features may have different properties
         if na not in ["null", "drop", "keep"]:
             raise ValueError(f"Unknown na method {na}")
 
-        if self._geometry_column_name not in self:
-            raise AttributeError(
-                "No geometry data set (expected in column "
-                f"'{self._geometry_column_name}')."
-            )
-
         ids = np.asarray(self.index)
-        geometries = np.asarray(self[self._geometry_column_name])
+        geometries = np.asarray(self.geometry)
 
         if not self.columns.is_unique:
             raise ValueError("GeoDataFrame cannot contain duplicated column names.")
@@ -1266,7 +1298,7 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
         DataFrame
             geometry columns are encoded to WKB
         """
-        df = DataFrame(self.copy())
+        df = DataFrame(self.copy(deep=not PANDAS_GE_30))
 
         # Encode all geometry columns to WKB
         for col in df.columns[df.dtypes == "geometry"]:
@@ -1288,7 +1320,7 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
         DataFrame
             geometry columns are encoded to WKT
         """
-        df = DataFrame(self.copy())
+        df = DataFrame(self.copy(deep=not PANDAS_GE_30))
 
         # Encode all geometry columns to WKT
         for col in df.columns[df.dtypes == "geometry"]:
@@ -1370,8 +1402,8 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
         >>> table = pa.table(arrow_table)
         >>> table
         pyarrow.Table
-        col1: string
-        geometry: binary
+        col1: large_string
+        geometry: extension<geoarrow.wkb<WkbType>>
         ----
         col1: [["name1","name2"]]
         geometry: [[0101000000000000000000F03F0000000000000040,\
@@ -1438,7 +1470,7 @@ default 'snappy'
             may not be supported by all readers.
         schema_version : {'0.1.0', '0.4.0', '1.0.0', '1.1.0', None}
             GeoParquet specification version; if not provided, will default to
-            latest supported stable version (1.0.0).
+            latest supported stable version (1.1.0).
         kwargs
             Additional keyword arguments passed to :func:`pyarrow.parquet.write_table`.
 
@@ -1502,9 +1534,9 @@ default 'snappy'
         compression : {'zstd', 'lz4', 'uncompressed'}, optional
             Name of the compression to use. Use ``"uncompressed"`` for no
             compression. By default uses LZ4 if available, otherwise uncompressed.
-        schema_version : {'0.1.0', '0.4.0', '1.0.0', None}
+        schema_version : {'0.1.0', '0.4.0', '1.0.0', '1.1.0' None}
             GeoParquet specification version; if not provided will default to
-            latest supported version.
+            latest supported stable version (1.1.0).
         kwargs
             Additional keyword arguments passed to
             :func:`pyarrow.feather.write_feather`.
@@ -1732,7 +1764,7 @@ default 'snappy'
 
         """
         if not inplace:
-            df = self.copy()
+            df = self.copy(deep=not PANDAS_GE_30)
         else:
             df = self
         df.geometry = df.geometry.set_crs(
@@ -1840,7 +1872,7 @@ default 'snappy'
         if inplace:
             df = self
         else:
-            df = self.copy()
+            df = self.copy(deep=not PANDAS_GE_30)
         geom = df.geometry.to_crs(crs=crs, epsg=epsg)
         df.geometry = geom
         if not inplace:
@@ -1914,6 +1946,12 @@ default 'snappy'
             else:
                 result.__class__ = DataFrame
         return result
+
+    def __delitem__(self, key) -> None:
+        """If the last geometry column is removed, downcast to a dataframe."""
+        super().__delitem__(key)
+        if (self.dtypes == "geometry").sum() == 0:
+            self.__class__ = DataFrame
 
     def _persist_old_default_geometry_colname(self) -> None:
         """Persist the default geometry column name of 'geometry' temporarily for
@@ -2000,7 +2038,10 @@ default 'snappy'
                 pass
             else:
                 if self.crs is not None and result.crs is None:
-                    result.set_crs(self.crs, inplace=True)
+                    if PANDAS_GE_30:
+                        result = result.set_crs(self.crs)
+                    else:
+                        result.set_crs(self.crs, inplace=True)
         elif isinstance(result, Series) and result.dtype == "object":
             # Try reconstruct series GeometryDtype if lost by apply
             # If all none and object dtype assert list of nones is more likely
@@ -2388,7 +2429,10 @@ default 'snappy'
         df = df.set_geometry(self._geometry_column_name).__finalize__(self)
 
         if ignore_index:
-            df.reset_index(inplace=True, drop=True)
+            if PANDAS_GE_30:
+                df = df.reset_index(drop=True)
+            else:
+                df.reset_index(inplace=True, drop=True)
         elif index_parts:
             # reset to MultiIndex, otherwise df index is only first level of
             # exploded GeoSeries index.

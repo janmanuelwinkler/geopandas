@@ -1,6 +1,5 @@
 import json
 import warnings
-from packaging.version import Version
 from typing import Literal, get_args
 
 import numpy as np
@@ -15,7 +14,7 @@ from geopandas.array import from_shapely, from_wkb
 
 from .file import _expand_user
 
-METADATA_VERSION = "1.0.0"
+METADATA_VERSION = "1.1.0"
 SUPPORTED_VERSIONS_LITERAL = Literal["0.1.0", "0.4.0", "1.0.0-beta.1", "1.0.0", "1.1.0"]
 SUPPORTED_VERSIONS = list(get_args(SUPPORTED_VERSIONS_LITERAL))
 GEOARROW_ENCODINGS = [
@@ -58,11 +57,7 @@ PARQUET_GEOMETRY_ENCODINGS = Literal["WKB", "geoarrow"]
 
 
 def _is_fsspec_url(url):
-    return (
-        isinstance(url, str)
-        and "://" in url
-        and not url.startswith(("http://", "https://"))
-    )
+    return isinstance(url, str) and "://" in url
 
 
 def _remove_id_from_member_of_ensembles(json_dict):
@@ -136,16 +131,17 @@ def _create_metadata(
     dict
     """
     if schema_version is None:
-        if geometry_encoding and any(
-            encoding != "WKB" for encoding in geometry_encoding.values()
-        ):
-            schema_version = "1.1.0"
-        else:
-            schema_version = METADATA_VERSION
+        schema_version = METADATA_VERSION
 
     if schema_version not in SUPPORTED_VERSIONS:
         raise ValueError(
             f"schema_version must be one of: {', '.join(SUPPORTED_VERSIONS)}"
+        )
+
+    if write_covering_bbox and schema_version < "1.1.0":
+        raise ValueError(
+            "Writing a bounding box column is only supported since GeoParquet 1.1.0, "
+            f"while a {schema_version=} is specified."
         )
 
     # Construct metadata for each geometry
@@ -379,6 +375,11 @@ def _geopandas_to_arrow(
     metadata = table.schema.metadata
     metadata.update({b"geo": _encode_metadata(geo_metadata)})
 
+    # Store attributes in metadata if exists
+    if df.attrs:
+        df_metadata = {"PANDAS_ATTRS": json.dumps(df.attrs)}
+        metadata |= df_metadata
+
     return table.replace_schema_metadata(metadata)
 
 
@@ -399,7 +400,7 @@ def _to_parquet(
 
     Requires 'pyarrow'.
 
-    This is tracking version 1.0.0 of the GeoParquet specification at:
+    This is tracking version 1.1.0 of the GeoParquet specification at:
     https://github.com/opengeospatial/geoparquet. Writing older versions is
     supported using the `schema_version` keyword.
 
@@ -407,7 +408,9 @@ def _to_parquet(
 
     Parameters
     ----------
-    path : str, path object
+    path : str, path object or file-like object
+        String, path object (implementing os.PathLike[str]) or file-like object
+        implementing a binary read() function.
     index : bool, default None
         If ``True``, always include the dataframe's index(es) as columns
         in the file output.
@@ -453,7 +456,7 @@ def _to_feather(df, path, index=None, compression=None, schema_version=None, **k
 
     Requires 'pyarrow' >= 0.17.
 
-    This is tracking version 1.0.0 of the GeoParquet specification for
+    This is tracking version 1.1.0 of the GeoParquet specification for
     the metadata at: https://github.com/opengeospatial/geoparquet. Writing
     older versions is supported using the `schema_version` keyword.
 
@@ -461,7 +464,9 @@ def _to_feather(df, path, index=None, compression=None, schema_version=None, **k
 
     Parameters
     ----------
-    path : str, path object
+    path : str, path object or file-like object
+        String, path object (implementing os.PathLike[str]) or file-like object
+        implementing a binary read() function.
     index : bool, default None
         If ``True``, always include the dataframe's index(es) as columns
         in the file output.
@@ -486,7 +491,7 @@ def _to_feather(df, path, index=None, compression=None, schema_version=None, **k
     feather.write_feather(table, path, compression=compression, **kwargs)
 
 
-def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None):
+def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None, df_attrs=None):
     """Convert a pyarrow Table to a GeoDataFrame.
 
     Helper function with main, shared logic for read_parquet/read_feather.
@@ -556,6 +561,10 @@ def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None):
 
         df.insert(result_column_names.index(col), col, geom_arr)
 
+    # Add dataframe attrs
+    if df_attrs:
+        df.attrs = json.loads(df_attrs)
+
     return GeoDataFrame(df, geometry=geometry)
 
 
@@ -578,7 +587,7 @@ def _get_filesystem_path(path, filesystem=None, storage_options=None):
 
     if _is_fsspec_url(path) and filesystem is None:
         fsspec = import_optional_dependency(
-            "fsspec", extra="fsspec is requred for 'storage_options'."
+            "fsspec", extra="fsspec is required for 'storage_options'."
         )
         filesystem, path = fsspec.core.url_to_fs(path, **(storage_options or {}))
 
@@ -642,14 +651,19 @@ def _read_parquet_schema_and_metadata(path, filesystem):
     import pyarrow
     from pyarrow import parquet
 
-    kwargs = {}
-    if Version(pyarrow.__version__) < Version("15.0.0"):
-        kwargs = dict(use_legacy_dataset=False)
-
     try:
-        schema = parquet.ParquetDataset(path, filesystem=filesystem, **kwargs).schema
-    except Exception:
-        schema = parquet.read_schema(path, filesystem=filesystem)
+        try:
+            schema = parquet.ParquetDataset(path, filesystem=filesystem).schema
+        except Exception:
+            schema = parquet.read_schema(path, filesystem=filesystem)
+    except OSError as exc:
+        if "Thrift LogicalType that is not recognized" in str(exc):
+            raise OSError(
+                "Reading GeoParquet 2.0 files with Parquet Geometry/Geography logical "
+                "types requires pyarrow>=20.0, while pyarrow "
+                f"{pyarrow.__version__} is installed."
+            ) from exc
+        raise
 
     metadata = schema.metadata
 
@@ -686,7 +700,7 @@ def _read_parquet(
       columns, the first available geometry column will be set as the geometry
       column of the returned GeoDataFrame.
 
-    Supports versions 0.1.0, 0.4.0 and 1.0.0 of the GeoParquet
+    Supports versions 0.1.0, 0.4.0, 1.0.0, 1.1.0 and 2.0.0 of the GeoParquet
     specification at: https://github.com/opengeospatial/geoparquet
 
     If 'crs' key is not present in the GeoParquet metadata associated with the
@@ -698,7 +712,9 @@ def _read_parquet(
 
     Parameters
     ----------
-    path : str, path object
+    path : str, path object or file-like object
+        String, path object (implementing os.PathLike[str]) or file-like object
+        implementing a binary read() function.
     columns : list-like of strings, default=None
         If not None, only these columns will be read from the file.  If
         the primary geometry column is not included, the first secondary
@@ -744,11 +760,16 @@ def _read_parquet(
     ...     "data.parquet",
     ...     columns=["geometry", "pop_est"]
     ... )  # doctest: +SKIP
+
+    From bytes:
+
+    >>> p_data = client.get_bytes("bucket/geodata.parquet") # doctest: +SKIP
+    >>> with BytesIO(p_data) as geo_bytes: # doctest: +SKIP
+    >>>     df = gpd.read_parquet(geo_bytes) # doctest: +SKIP
     """
     parquet = import_optional_dependency(
         "pyarrow.parquet", extra="pyarrow is required for Parquet support."
     )
-    import geopandas.io._pyarrow_hotfix  # noqa: F401
 
     # TODO(https://github.com/pandas-dev/pandas/pull/41194): see if pandas
     # adds filesystem as a keyword and match that.
@@ -791,7 +812,12 @@ def _read_parquet(
         path, columns=columns, filesystem=filesystem, filters=filters, **kwargs
     )
 
-    return _arrow_to_geopandas(table, geo_metadata, to_pandas_kwargs)
+    if metadata and b"PANDAS_ATTRS" in metadata:
+        df_attrs = metadata[b"PANDAS_ATTRS"]
+    else:
+        df_attrs = None
+
+    return _arrow_to_geopandas(table, geo_metadata, to_pandas_kwargs, df_attrs)
 
 
 def _read_feather(path, columns=None, to_pandas_kwargs=None, **kwargs):
@@ -820,7 +846,9 @@ def _read_feather(path, columns=None, to_pandas_kwargs=None, **kwargs):
 
     Parameters
     ----------
-    path : str, path object
+    path : str, path object or file-like object
+        String, path object (implementing os.PathLike[str]) or file-like object
+        implementing a binary read() function.
     columns : list-like of strings, default=None
         If not None, only these columns will be read from the file.  If
         the primary geometry column is not included, the first secondary
@@ -850,11 +878,13 @@ def _read_feather(path, columns=None, to_pandas_kwargs=None, **kwargs):
     ...     "data.feather",
     ...     columns=["geometry", "pop_est"]
     ... )  # doctest: +SKIP
+
+    See the `read_parquet` docs for examples of reading and writing
+    to/from bytes objects.
     """
     feather = import_optional_dependency(
         "pyarrow.feather", extra="pyarrow is required for Feather support."
     )
-    import geopandas.io._pyarrow_hotfix  # noqa: F401
 
     path = _expand_user(path)
 

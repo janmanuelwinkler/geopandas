@@ -20,8 +20,6 @@ geodatasets = pytest.importorskip("geodatasets")
 from branca.colormap import StepColormap
 from matplotlib import cm, colors
 
-BRANCA_05 = Version(branca.__version__) > Version("0.4.2")
-FOLIUM_G_014 = Version(folium.__version__) > Version("0.14.0")
 FOLIUM_GE_019 = Version(folium.__version__) >= Version("0.19.0")
 
 
@@ -273,7 +271,7 @@ class TestExplore:
         for c in cmap:
             assert f'"fillColor":"{c}"' in out_str
 
-        with pytest.raises(ValueError, match="'cmap' is invalid."):
+        with pytest.raises(ValueError, match="'cmap' is invalid"):
             self.nybb.explore(column="BoroName", cmap="nonsense")
 
     def test_categories(self):
@@ -607,14 +605,10 @@ class TestExplore:
         df2["values"] = df2["BoroCode"] * 10.0
         m = df2[df2["values"] >= 30].explore("values", vmin=0)
         out_str = self._fetch_map_string(m)
-        if FOLIUM_G_014:
-            assert 'case"0":return{"color":"#fde725","fillColor":"#fde725"' in out_str
-            assert 'case"1":return{"color":"#7ad151","fillColor":"#7ad151"' in out_str
-            assert 'default:return{"color":"#22a884","fillColor":"#22a884"' in out_str
-        else:
-            assert 'case"1":return{"color":"#7ad151","fillColor":"#7ad151"' in out_str
-            assert 'case"2":return{"color":"#22a884","fillColor":"#22a884"' in out_str
-            assert 'default:return{"color":"#fde725","fillColor":"#fde725"' in out_str
+
+        assert 'case"0":return{"color":"#fde725","fillColor":"#fde725"' in out_str
+        assert 'case"1":return{"color":"#7ad151","fillColor":"#7ad151"' in out_str
+        assert 'default:return{"color":"#22a884","fillColor":"#22a884"' in out_str
 
         df2["values_negative"] = df2["BoroCode"] * -10.0
         m = df2[df2["values_negative"] <= 30].explore("values_negative", vmax=0)
@@ -652,6 +646,55 @@ class TestExplore:
         )
         out_str = self._fetch_map_string(m)
         assert "red'></span>NaN" in out_str
+
+    def test_categorical_legend_custom_labels(self):
+        # GH3496: custom legend labels must be honored for categorical and
+        # boolean columns
+        labels = [
+            "Cat0",
+            "Cat1",
+            "Cat2",
+            "Cat3",
+            "Cat4",
+            "Cat5",
+            "Cat6",
+            "Cat7",
+        ]
+        m = self.world.explore("continent", legend=True, legend_kwds={"labels": labels})
+        out_str = self._fetch_map_string(m)
+        for label in labels:
+            assert label in out_str
+        # original category names must no longer appear as legend rows
+        assert "'></span>Africa" not in out_str
+        assert "'></span>SouthAmerica" not in out_str
+
+        # a length mismatch must raise a clear error
+        with pytest.raises(ValueError, match="number of legend labels"):
+            self.world.explore(
+                "continent", legend=True, legend_kwds={"labels": ["only", "two"]}
+            )
+
+        # custom labels combined with a missing (NaN) row: the NaN entry must
+        # still render after the custom labels and not consume a custom label
+        m = self.missing.explore(
+            "continent",
+            legend=True,
+            legend_kwds={"labels": labels},
+            missing_kwds={"color": "red"},
+        )
+        out_str = self._fetch_map_string(m)
+        assert "Cat0" in out_str
+        assert "red'></span>NaN" in out_str
+
+        # GH3496: also works for boolean columns (the original reporter's case)
+        nybb_bool = self.nybb.copy()
+        nybb_bool["is_manhattan"] = nybb_bool["BoroName"] == "Manhattan"
+        m = nybb_bool.explore(
+            "is_manhattan", legend=True, legend_kwds={"labels": ["Outer", "Core"]}
+        )
+        out_str = self._fetch_map_string(m)
+        assert "Outer" in out_str
+        assert "Core" in out_str
 
     def test_colorbar(self):
         def quoted_in(find, s):
@@ -713,7 +756,6 @@ class TestExplore:
         assert out_str.count("f1e2ccff") == 62
         assert out_str.count("ccccccff") == 63
 
-    @pytest.mark.skipif(not BRANCA_05, reason="requires branca >= 0.5.0")
     def test_colorbar_max_labels(self):
         import re
 
